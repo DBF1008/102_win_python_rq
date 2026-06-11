@@ -920,6 +920,19 @@ class Job:
 
         return Result.all(self, serializer=self.serializer)
 
+    def fetch_result(self, result_id: str) -> Result | None:
+        """Fetch a single historical result by its stream entry ID.
+
+        Args:
+            result_id (str): The Redis stream entry ID (e.g. ``"1234567890123-0"``).
+
+        Returns:
+            result (Result | None): The matching Result, or None if the ID does not exist.
+        """
+        from .results import Result
+
+        return Result.fetch(self, result_id, serializer=self.serializer)
+
     def latest_result(self, timeout: int = 0) -> Result | None:
         """Get the latest job result.
 
