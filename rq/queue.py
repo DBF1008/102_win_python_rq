@@ -62,14 +62,16 @@ class EnqueueData(
             'on_failure',
             'on_stopped',
             'repeat',
+            'unique',
         ],
     )
 ):
-    """Helper type to use when calling enqueue_many
-    NOTE: Does not support `depends_on` yet.
-    """
+    """Helper type to use when calling enqueue_many"""
 
     __slots__ = ()
+
+    def __new__(cls, *args, unique=False, **kwargs):
+        return super().__new__(cls, *args, unique=unique, **kwargs)
 
 
 class EnqueueArgs(NamedTuple):
@@ -790,6 +792,7 @@ class Queue:
         on_failure: Callback | Callable | None = None,
         on_stopped: Callback | Callable | None = None,
         repeat: Repeat | None = None,
+        unique: bool = False,
     ) -> EnqueueData:
         """Need this till support dropped for python_version < 3.7, where defaults can be specified for named tuples
         And can keep this logic within EnqueueData
@@ -815,6 +818,8 @@ class Queue:
             on_stopped (Optional[Union[Callback, Callable[..., Any]]], optional): Callback for on stopped. Defaults to
                 None. Callable is deprecated.
             repeat (Optional[Repeat], optional): Repeat object. Defaults to None.
+            unique (bool, optional): If True, raises DuplicateJobError if a job with the same ID exists.
+                Defaults to False.
 
         Returns:
             EnqueueData: The EnqueueData
@@ -837,6 +842,7 @@ class Queue:
             on_failure,
             on_stopped,
             repeat,
+            unique=unique,
         )
 
     def enqueue_many(
@@ -845,21 +851,42 @@ class Queue:
         """Creates multiple jobs (created via `Queue.prepare_data` calls)
         to represent the delayed function calls and enqueues them.
 
+        Supports mixed batches where some entries have ``unique=True`` and
+        others do not.  Unique entries are atomically checked for duplicates
+        via the same Lua script used by ``enqueue(unique=True)``.
+
+        * ``unique=True`` with ``depends_on`` raises ``ValueError`` (same
+          constraint as single enqueue).
+        * ``unique=True`` without ``job_id`` raises ``ValueError``.
+        * Unique jobs bypass the Redis pipeline (the Lua script is atomic on
+          the connection), which is consistent with single-enqueue behaviour.
+
         Args:
             job_datas (List['EnqueueData']): A List of job data
             pipeline (Optional[Pipeline], optional): The Redis Pipeline. Defaults to None.
+            group_id (Optional[str], optional): A group ID to tag all jobs with. Defaults to None.
 
         Returns:
-            List[Job]: A list of enqueued jobs
+            List[Job]: A list of enqueued jobs, in the same order as *job_datas*.
+
+        Raises:
+            ValueError: If a unique entry is missing ``job_id`` or has ``depends_on``.
+            DuplicateJobError: If a unique entry's ``job_id`` already exists in Redis.
         """
+        job_datas_list = list(job_datas)
+
+        # ---- validation -------------------------------------------------
+        for jd in job_datas_list:
+            if jd.unique:
+                if jd.depends_on:
+                    raise ValueError('unique=True is not supported with job dependencies')
+                if not jd.job_id:
+                    raise ValueError('unique=True requires an explicit job_id')
+
         pipe = pipeline if pipeline is not None else self.connection.pipeline()
 
         # Add Queue key set
         pipe.sadd(self.redis_queues_keys, self.key)
-
-        jobs_without_dependencies = []
-        jobs_with_unmet_dependencies = []
-        jobs_with_met_dependencies = []
 
         def get_job_kwargs(job_data, initial_status):
             return {
@@ -883,44 +910,79 @@ class Queue:
                 'repeat': job_data.repeat,
             }
 
-        # Enqueue jobs without dependencies
-        job_datas_without_dependencies = [job_data for job_data in job_datas if not job_data.depends_on]
-        if job_datas_without_dependencies:
-            jobs_without_dependencies = [
-                self._enqueue_job(
-                    self.create_job(**get_job_kwargs(job_data, JobStatus.QUEUED)),
+        # ---- partition the batch ----------------------------------------
+        # result_map preserves the caller's input order.
+        result_map: dict[int, Job] = {}
+
+        # 1) Unique jobs WITHOUT dependencies  →  atomic Lua enqueue
+        unique_no_deps = [
+            (i, jd) for i, jd in enumerate(job_datas_list)
+            if jd.unique and not jd.depends_on
+        ]
+        for i, jd in unique_no_deps:
+            job = self.create_job(**get_job_kwargs(jd, JobStatus.QUEUED))
+            self._prepare_for_queue(job)
+            save_unique_job(self.connection, self.key, job, at_front=jd.at_front)
+            result_map[i] = job
+
+        # 2) Non-unique jobs WITHOUT dependencies  →  normal pipeline
+        normal_no_deps = [
+            (i, jd) for i, jd in enumerate(job_datas_list)
+            if not jd.unique and not jd.depends_on
+        ]
+        if normal_no_deps:
+            for i, jd in normal_no_deps:
+                job = self._enqueue_job(
+                    self.create_job(**get_job_kwargs(jd, JobStatus.QUEUED)),
                     pipeline=pipe,
-                    at_front=job_data.at_front,
+                    at_front=jd.at_front,
                 )
-                for job_data in job_datas_without_dependencies
-            ]
+                result_map[i] = job
             if pipeline is None:
                 pipe.execute()
 
-        job_datas_with_dependencies = [job_data for job_data in job_datas if job_data.depends_on]
-        if job_datas_with_dependencies:
+        # 3) Jobs WITH dependencies (all non-unique — unique+deps rejected above)
+        with_deps = [
+            (i, jd) for i, jd in enumerate(job_datas_list)
+            if jd.depends_on
+        ]
+        jobs_with_unmet_dependencies: list[Job] = []
+        jobs_with_met_dependencies: list[Job] = []
+
+        if with_deps:
             # Save all jobs with dependencies as deferred
-            jobs_with_dependencies = [
-                self.create_job(**get_job_kwargs(job_data, JobStatus.DEFERRED))
-                for job_data in job_datas_with_dependencies
-            ]
-            for job in jobs_with_dependencies:
+            deferred_jobs: list[tuple[int, Job]] = []
+            for i, jd in with_deps:
+                job = self.create_job(**get_job_kwargs(jd, JobStatus.DEFERRED))
                 job.save(pipeline=pipe)
+                deferred_jobs.append((i, job))
             if pipeline is None:
                 pipe.execute()
 
             # Enqueue the jobs whose dependencies have been met
-            jobs_with_met_dependencies, jobs_with_unmet_dependencies = Dependency.get_jobs_with_met_dependencies(
-                jobs_with_dependencies, pipeline=pipe
-            )
-            jobs_with_met_dependencies = [
-                self._enqueue_job(job, pipeline=pipe, at_front=job.enqueue_at_front)
-                for job in jobs_with_met_dependencies
-            ]
+            all_deferred = [j for _, j in deferred_jobs]
+            met, unmet = Dependency.get_jobs_with_met_dependencies(all_deferred, pipeline=pipe)
+
+            # Build lookup: job id → original index
+            id_to_idx = {j.id: i for i, j in deferred_jobs}
+
+            for job in met:
+                idx = id_to_idx[job.id]
+                enqueued = self._enqueue_job(job, pipeline=pipe, at_front=job.enqueue_at_front)
+                result_map[idx] = enqueued
+
+            for job in unmet:
+                idx = id_to_idx[job.id]
+                jobs_with_unmet_dependencies.append(job)
+                result_map[idx] = job
+
+            jobs_with_met_dependencies = [result_map[id_to_idx[j.id]] for j in met]
+
             if pipeline is None:
                 pipe.execute()
 
-        return jobs_without_dependencies + jobs_with_unmet_dependencies + jobs_with_met_dependencies
+        # ---- rebuild in original input order ----------------------------
+        return [result_map[i] for i in range(len(job_datas_list))]
 
     def run_job(self, job: Job) -> Job:
         """Run the job
