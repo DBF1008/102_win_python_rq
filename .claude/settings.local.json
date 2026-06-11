@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 install:*)",
+      "Bash(git stash:*)",
+      "Bash(python3 -m pytest tests/test_executions.py::TestRegistry::test_execution_added_to_started_job_registry -v)"
+    ]
+  }
+}

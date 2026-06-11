@@ -330,3 +330,127 @@ class TestResult(RQTestCase):
         Result.create(job, Result.Type.SUCCESSFUL, ttl=10, return_value=2)
         result_blocking = Result.fetch_latest(job, timeout=1)
         self.assertEqual(result_blocking.return_value, 2)
+
+    def test_fetch_successful_result_by_id(self):
+        """Result.fetch() restores a successful result by stream entry ID."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello)
+
+        started = now().replace(microsecond=0)
+        ended = started + timedelta(seconds=1)
+        created = Result.create(
+            job,
+            Result.Type.SUCCESSFUL,
+            ttl=10,
+            return_value='hello',
+            worker_name='worker-1',
+            execution_id='exec-ok',
+            execution_started_at=started,
+            execution_ended_at=ended,
+        )
+
+        # Fetch by ID via the class method
+        fetched = Result.fetch(job, created.id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.id, created.id)
+        self.assertEqual(fetched.type, Result.Type.SUCCESSFUL)
+        self.assertEqual(fetched.return_value, 'hello')
+        self.assertEqual(fetched.worker_name, 'worker-1')
+        self.assertEqual(fetched.execution_id, 'exec-ok')
+        self.assertEqual(fetched.execution_started_at, started)
+        self.assertEqual(fetched.execution_ended_at, ended)
+
+        # Also reachable through the Job convenience method
+        self.assertEqual(job.result_by_id(created.id), fetched)
+
+    def test_fetch_failed_result_by_id(self):
+        """Result.fetch() restores a failed result with exc_string intact."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello)
+
+        started = now().replace(microsecond=0)
+        ended = started + timedelta(seconds=2)
+        created = Result.create_failure(
+            job,
+            ttl=10,
+            exc_string='Traceback: ZeroDivisionError',
+            worker_name='worker-2',
+            execution_id='exec-fail',
+            execution_started_at=started,
+            execution_ended_at=ended,
+        )
+
+        fetched = Result.fetch(job, created.id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.id, created.id)
+        self.assertEqual(fetched.type, Result.Type.FAILED)
+        self.assertEqual(fetched.exc_string, 'Traceback: ZeroDivisionError')
+        self.assertIsNone(fetched.return_value)
+        self.assertEqual(fetched.worker_name, 'worker-2')
+        self.assertEqual(fetched.execution_id, 'exec-fail')
+        self.assertEqual(fetched.execution_started_at, started)
+        self.assertEqual(fetched.execution_ended_at, ended)
+
+        # Job convenience method
+        self.assertEqual(job.result_by_id(created.id), fetched)
+
+    def test_fetch_retried_result_by_id(self):
+        """Result.fetch() restores a retried result including Retry return value."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello)
+        retry = Retry(max=3, interval=[1, 2, 3])
+
+        started = now().replace(microsecond=0)
+        ended = started + timedelta(seconds=1)
+        created = Result.create_retried(
+            job,
+            ttl=10,
+            return_value=retry,
+            worker_name='worker-3',
+            execution_id='exec-retry',
+            execution_started_at=started,
+            execution_ended_at=ended,
+        )
+
+        fetched = Result.fetch(job, created.id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.id, created.id)
+        self.assertEqual(fetched.type, Result.Type.RETRIED)
+        self.assertIsInstance(fetched.return_value, Retry)
+        self.assertEqual(fetched.return_value.max, retry.max)
+        self.assertEqual(fetched.return_value.intervals, retry.intervals)
+        self.assertEqual(fetched.execution_id, 'exec-retry')
+        self.assertEqual(fetched.execution_started_at, started)
+        self.assertEqual(fetched.execution_ended_at, ended)
+
+    def test_fetch_nonexistent_result_returns_none(self):
+        """Result.fetch() returns None when the stream entry ID does not exist."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello)
+
+        # No results at all
+        self.assertIsNone(Result.fetch(job, '9999999999999-0'))
+        self.assertIsNone(job.result_by_id('9999999999999-0'))
+
+        # Add a real result, then query a bogus ID — still None
+        Result.create(job, Result.Type.SUCCESSFUL, ttl=10, return_value=1)
+        self.assertIsNone(Result.fetch(job, '9999999999999-0'))
+        self.assertIsNone(job.result_by_id('0-0'))
+
+    def test_fetch_among_multiple_results(self):
+        """Result.fetch() picks the correct entry when several results exist."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello)
+
+        r1 = Result.create_failure(job, ttl=10, exc_string='err1', worker_name='w1')
+        r2 = Result.create(job, Result.Type.SUCCESSFUL, ttl=10, return_value=42, worker_name='w2')
+        r3 = Result.create(job, Result.Type.SUCCESSFUL, ttl=10, return_value=99, worker_name='w3')
+
+        # Each fetch returns exactly the right result
+        self.assertEqual(Result.fetch(job, r1.id).exc_string, 'err1')
+        self.assertEqual(Result.fetch(job, r2.id).return_value, 42)
+        self.assertEqual(Result.fetch(job, r3.id).return_value, 99)
+
+        # latest_result and results() remain compatible
+        self.assertEqual(job.latest_result(), r3)
+        self.assertEqual(job.results(), [r3, r2, r1])

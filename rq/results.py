@@ -239,16 +239,35 @@ class Result:
         )
 
     @classmethod
-    def fetch(cls, job: Job, serializer=None) -> Result | None:
-        """Fetch a result that matches a given job ID. The current sorted set
-        based implementation does not allow us to fetch a given key by ID
-        so we need to iterate through results, deserialize the payload and
-        look for a matching ID.
+    def fetch(cls, job: Job, result_id: str, serializer=None) -> Result | None:
+        """Fetch a single result by its Redis stream entry ID.
 
-        Future Redis streams based implementation may make this more efficient
-        and scalable.
+        Uses XRANGE with the same ID for min and max so that only the
+        matching entry is returned.  This is an O(1) operation on the
+        stream and fully restores the Result object — including execution
+        metadata, serialized return value and exception information.
+
+        Args:
+            job: The Job that owns the result.
+            result_id: The Redis stream entry ID (e.g. ``"1718000000000-0"``).
+            serializer: Optional serializer override.
+
+        Returns:
+            Result | None: The matching Result, or ``None`` when no entry
+            with *result_id* exists in the stream.
         """
-        return None
+        key = cls.get_key(job.id)
+        response = job.connection.xrange(key, min=result_id, max=result_id)
+        if not response:
+            return None
+        entry_id, payload = response[0]
+        return cls.restore(
+            job.id,
+            entry_id.decode(),
+            payload,
+            connection=job.connection,
+            serializer=serializer,
+        )
 
     @classmethod
     def fetch_latest(cls, job: Job, serializer=None, timeout: int = 0) -> Result | None:

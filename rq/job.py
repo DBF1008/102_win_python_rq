@@ -933,6 +933,26 @@ class Job:
 
         return Result.fetch_latest(self, serializer=self.serializer, timeout=timeout)
 
+    def result_by_id(self, result_id: str) -> Result | None:
+        """Fetch a historical result by its Redis stream entry ID.
+
+        This is useful for auditing a specific execution attempt.  The
+        returned ``Result`` carries fully restored execution metadata,
+        serialized return value and exception information.
+
+        Args:
+            result_id: The stream entry ID of the result
+                (e.g. ``"1718000000000-0"``).  These IDs are available on
+                every ``Result`` object via its ``id`` attribute.
+
+        Returns:
+            result (Result | None): The matching ``Result``, or ``None``
+            when no entry with *result_id* exists.
+        """
+        from .results import Result
+
+        return Result.fetch(self, result_id, serializer=self.serializer)
+
     def restore(self, raw_data) -> Any:
         """Overwrite properties with the provided values stored in Redis.
 
