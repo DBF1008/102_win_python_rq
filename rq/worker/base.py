@@ -1453,8 +1453,6 @@ class BaseWorker:
                     queue.enqueue_dependents(job, pipeline=pipeline)
 
                     if not pipeline.explicit_transaction:
-                        # enqueue_dependents didn't call multi after all!
-                        # We have to do it ourselves to make sure everything runs in a transaction
                         self.log.debug('Worker %s: calling multi() on pipeline for job %s', self.name, job.id)
                         pipeline.multi()
 
@@ -1462,11 +1460,13 @@ class BaseWorker:
                     self.increment_total_working_time(job.ended_at - job.started_at, pipeline)  # type: ignore
 
                     result_ttl = job.get_result_ttl(self.default_result_ttl)
+                    execution_id = self.execution.id if self.execution else None
+                    execution_started_at = self.execution.created_at if self.execution else None
+
+                    # Record execution result (shared by both repeat and normal paths)
                     if result_ttl != 0:
                         self.log.debug("Worker %s: saving job %s's successful execution result", self.name, job.id)
-                        execution_id = self.execution.id if self.execution else None
-                        execution_started_at = self.execution.created_at if self.execution else None
-                        job._handle_success(
+                        job._save_result(
                             result_ttl,
                             pipeline=pipeline,
                             worker_name=self.name,
@@ -1478,11 +1478,18 @@ class BaseWorker:
                     if job.repeats_left is not None and job.repeats_left > 0:
                         from ..repeat import Repeat
 
+                        # Repeat path: reschedule without marking FINISHED or adding to FinishedJobRegistry
                         self.log.info(
                             'Worker %s: job %s scheduled to repeat (%s left)', self.name, job.id, job.repeats_left
                         )
                         Repeat.schedule(job, queue, pipeline=pipeline)
                     else:
+                        # Normal path: full completion — status, registry, cleanup
+                        if result_ttl != 0:
+                            job.set_status(JobStatus.FINISHED, pipeline=pipeline)
+                            job.save(pipeline=pipeline, include_meta=False, include_result=False)
+                            finished_job_registry = job.finished_job_registry
+                            finished_job_registry.add(job, result_ttl, pipeline)
                         job.cleanup(result_ttl, pipeline=pipeline, remove_from_queue=False)
 
                     self.log.debug('Cleaning up execution of job %s', job.id)

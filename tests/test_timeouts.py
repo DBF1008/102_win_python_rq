@@ -1,14 +1,21 @@
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 from rq import Queue, SimpleWorker
-from rq.registry import FailedJobRegistry, FinishedJobRegistry
+from rq.executions import prepare_execution
+from rq.job import Job, JobStatus
+from rq.registry import FailedJobRegistry, FinishedJobRegistry, StartedJobRegistry
+from rq.repeat import Repeat
+from rq.results import Result
 from rq.timeouts import (
     TimerDeathPenalty,
     UnixSignalDeathPenalty,
     get_default_death_penalty_class,
 )
+from rq.utils import now
 from tests import RQTestCase
+from tests.fixtures import say_hello
 
 
 class TimerBasedWorker(SimpleWorker):
@@ -68,3 +75,115 @@ class TestTimeouts(RQTestCase):
         delattr(mock_signal, 'SIGALRM')
         self.assertFalse(hasattr(mock_signal, 'SIGALRM'))
         self.assertEqual(get_default_death_penalty_class(), TimerDeathPenalty)
+
+
+class TestSuccessPath(RQTestCase):
+    """Tests for the success completion path in handle_job_success."""
+
+    def test_handle_job_success_normal(self):
+        """Normal success: job lands in FinishedJobRegistry, Result is recorded,
+        execution is cleaned up, and status is FINISHED."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello)
+        worker = SimpleWorker([queue], connection=self.connection)
+        worker.register_birth()
+
+        registry = StartedJobRegistry(connection=self.connection)
+        job.started_at = now()
+        job.ended_at = job.started_at + timedelta(seconds=0.5)
+        job._result = 'hello'
+        job._status = JobStatus.FINISHED
+
+        prepare_execution(worker, job)
+        worker.handle_job_success(job, queue, registry)
+
+        # Status persisted as FINISHED
+        self.assertEqual(job.get_status(), JobStatus.FINISHED)
+
+        # Job is in FinishedJobRegistry
+        finished_registry = FinishedJobRegistry(connection=self.connection)
+        self.assertIn(job, finished_registry)
+
+        # Result record exists
+        result = Result.fetch_latest(job)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.type, Result.Type.SUCCESSFUL)
+
+        # Execution cleaned up
+        self.assertIsNone(worker.execution)
+
+        # Stats incremented (refresh from Redis since pipeline wrote there)
+        worker.refresh()
+        self.assertEqual(worker.successful_job_count, 1)
+        self.assertGreater(worker.total_working_time, 0)
+
+    def test_handle_job_success_repeat(self):
+        """Repeat success: job is re-enqueued, NOT in FinishedJobRegistry,
+        Result is recorded, execution is cleaned up, repeats_left decremented."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(say_hello, repeat=Repeat(times=2))
+        worker = SimpleWorker([queue], connection=self.connection)
+        worker.register_birth()
+
+        # Drain the queue so we can verify re-enqueue
+        queue.empty()
+        self.assertNotIn(job.id, queue.get_job_ids())
+
+        registry = StartedJobRegistry(connection=self.connection)
+        job.started_at = now()
+        job.ended_at = job.started_at + timedelta(seconds=0.5)
+        job._result = 'hello'
+        job._status = JobStatus.FINISHED
+
+        prepare_execution(worker, job)
+        worker.handle_job_success(job, queue, registry)
+
+        # Job is re-enqueued (not finished)
+        self.assertIn(job.id, queue.get_job_ids())
+
+        # Job is NOT in FinishedJobRegistry
+        finished_registry = FinishedJobRegistry(connection=self.connection)
+        self.assertNotIn(job, finished_registry)
+
+        # repeats_left decremented
+        job.refresh()
+        self.assertEqual(job.repeats_left, 1)
+
+        # Result record still exists (records this execution)
+        result = Result.fetch_latest(job)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.type, Result.Type.SUCCESSFUL)
+
+        # Execution cleaned up
+        self.assertIsNone(worker.execution)
+
+        # Stats incremented (refresh from Redis since pipeline wrote there)
+        worker.refresh()
+        self.assertEqual(worker.successful_job_count, 1)
+
+    def test_handle_job_success_with_dependents(self):
+        """Success with dependents: dependent job is enqueued after parent completes,
+        parent is properly finalized."""
+        queue = Queue(connection=self.connection)
+        parent_job = queue.enqueue(say_hello)
+        dependent_job = queue.enqueue(say_hello, depends_on=parent_job)
+
+        # dependent should be deferred, not in queue
+        self.assertEqual(dependent_job.get_status(), JobStatus.DEFERRED)
+
+        worker = SimpleWorker([queue], connection=self.connection)
+
+        # Run only the parent job
+        worker.work(burst=True, max_jobs=1)
+
+        # Parent completed successfully
+        parent_job = Job.fetch(parent_job.id, connection=self.connection)
+        self.assertEqual(parent_job.get_status(), JobStatus.FINISHED)
+
+        # Parent is in FinishedJobRegistry
+        finished_registry = FinishedJobRegistry(connection=self.connection)
+        self.assertIn(parent_job, finished_registry)
+
+        # Dependent was enqueued
+        dependent_job = Job.fetch(dependent_job.id, connection=self.connection)
+        self.assertEqual(dependent_job.get_status(), JobStatus.QUEUED)

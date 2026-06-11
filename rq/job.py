@@ -1537,6 +1537,30 @@ class Job:
             self.log.exception('Job %s: error while executing stopped callback', self.id)
             raise
 
+    def _save_result(
+        self,
+        result_ttl,
+        pipeline: Pipeline,
+        worker_name: str = '',
+        execution_id: str | None = None,
+        execution_started_at: datetime | None = None,
+        execution_ended_at: datetime | None = None,
+    ):
+        """Records the successful execution result without changing job status or registry."""
+        from .results import Result
+
+        Result.create(
+            self,
+            Result.Type.SUCCESSFUL,
+            return_value=self._result,
+            ttl=result_ttl,
+            worker_name=worker_name,
+            pipeline=pipeline,
+            execution_id=execution_id,
+            execution_started_at=execution_started_at,
+            execution_ended_at=execution_ended_at,
+        )
+
     def _handle_success(
         self,
         result_ttl,
@@ -1552,15 +1576,11 @@ class Job:
         self.set_status(JobStatus.FINISHED, pipeline=pipeline)
         # Don't clobber user's meta dictionary!
         self.save(pipeline=pipeline, include_meta=False, include_result=False)
-        from .results import Result
 
-        Result.create(
-            self,
-            Result.Type.SUCCESSFUL,
-            return_value=self._result,
-            ttl=result_ttl,
-            worker_name=worker_name,
+        self._save_result(
+            result_ttl,
             pipeline=pipeline,
+            worker_name=worker_name,
             execution_id=execution_id,
             execution_started_at=execution_started_at,
             execution_ended_at=execution_ended_at,
