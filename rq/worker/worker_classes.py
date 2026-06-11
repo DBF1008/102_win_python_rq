@@ -163,7 +163,12 @@ class SpawnWorker(Worker):
     """
 
     def fork_work_horse(self, job: Job, queue: Queue):
-        """Spawns a work horse to perform the actual work using os.spawn()."""
+        """Spawns a work horse to perform the actual work using os.spawnv().
+
+        Custom ``worker_class``, ``job_class``, ``queue_class`` and
+        ``serializer`` are forwarded so the child process uses the same
+        classes as the parent instead of hardcoded defaults.
+        """
         os.environ['RQ_WORKER_ID'] = self.name
         os.environ['RQ_EXECUTION_ID'] = self.execution.id  # type: ignore
 
@@ -173,6 +178,10 @@ class SpawnWorker(Worker):
             del redis_kwargs['retry']
         if redis_kwargs.get('driver_info'):
             del redis_kwargs['driver_info']
+
+        worker_class_path = f'{self.__class__.__module__}.{self.__class__.__qualname__}'
+        queue_class_path = f'{self.queue_class.__module__}.{self.queue_class.__qualname__}'
+        job_class_path = f'{self.job_class.__module__}.{self.job_class.__qualname__}'
 
         child_pid = os.spawnv(
             os.P_NOWAIT,
@@ -184,19 +193,28 @@ class SpawnWorker(Worker):
 import os
 import sys
 from redis import Redis
-from rq import Worker, Queue
-from rq.job import Job
 from rq.executions import Execution
+from rq.utils import import_attribute
+
+# Import custom classes by dotted path
+worker_class = import_attribute({worker_class_path!r})
+queue_class = import_attribute({queue_class_path!r})
+job_class = import_attribute({job_class_path!r})
 
 # Recreate worker instance
 redis = Redis(**{redis_kwargs!r})
-worker = Worker.find_by_key({self.key!r}, connection=redis, serializer={self._serializer_arg!r})
+worker = worker_class.find_by_key({self.key!r}, connection=redis, serializer={self._serializer_arg!r})
 if not worker:
     sys.exit(1)
 
 # Reconstruct job, queue and execution objects
-job = Job.fetch({job.id!r}, connection=worker.connection, serializer=worker.serializer)
-queue = Queue({queue.name!r}, connection=worker.connection, serializer=worker.serializer)
+job = job_class.fetch({job.id!r}, connection=worker.connection, serializer=worker.serializer)
+queue = queue_class(
+    {queue.name!r},
+    connection=worker.connection,
+    job_class=worker.job_class,
+    serializer=worker.serializer,
+)
 execution_id = os.environ["RQ_EXECUTION_ID"]
 worker.execution = Execution.fetch(execution_id, job.id, connection=worker.connection)
 
