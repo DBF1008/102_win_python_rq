@@ -12,6 +12,11 @@ from .job import Job
 from .queue import EnqueueData
 from .utils import as_text
 
+# Default chunk size for batched EXISTS calls in cleanup().
+# Keeps individual Redis commands bounded while still drastically reducing
+# round-trips compared to one EXISTS per job.
+_CLEANUP_BATCH_SIZE = 1000
+
 
 class Group:
     """A Group is a container for tracking multiple jobs with a single identifier."""
@@ -28,35 +33,69 @@ class Group:
         return f'Group(id={self.name})'
 
     def _add_jobs(self, jobs: Iterable[Job], pipeline: Pipeline):
-        """Add jobs to the group"""
+        """Add jobs to the group's Redis set and register the group in the
+        global registry.
+
+        The caller is responsible for executing the pipeline so that external
+        pipelines (provided by a caller that wants atomic control over the
+        commit boundary) are never submitted behind their back.
+        """
         pipeline.sadd(self.key, *[job.id for job in jobs])
         pipeline.sadd(self.REDIS_GROUP_KEY, self.name)
-        pipeline.execute()
 
     def cleanup(self):
-        """Delete jobs from the group's job registry that have been deleted or expired from Redis.
-        We assume while running this that alive jobs have all been fetched from Redis in fetch_jobs method"""
-        with self.connection.pipeline() as pipe:  # Use a new pipeline
-            job_ids = [as_text(job) for job in list(self.connection.smembers(self.key))]
-            if not job_ids:
-                return
-            expired_job_ids = []
-            for job in job_ids:
-                pipe.exists(Job.key_for(job))
-            results = pipe.execute()
+        """Delete jobs from the group's job registry that have been deleted or
+        expired from Redis.
 
-            for i, key_exists in enumerate(results):
-                if not key_exists:
-                    expired_job_ids.append(job_ids[i])
-            if expired_job_ids:
-                pipe.srem(self.key, *expired_job_ids)
-                pipe.execute()
+        Uses batched ``EXISTS`` checks (chunked into ``_CLEANUP_BATCH_SIZE``
+        pieces) so that groups with thousands of members don't issue one Redis
+        command per job.  Each chunk is executed as a single pipeline round
+        trip, keeping the number of network round trips proportional to
+        ``ceil(N / batch_size)`` instead of ``N``.
+        """
+        job_ids = [as_text(job) for job in self.connection.smembers(self.key)]
+        if not job_ids:
+            return
 
-    def enqueue_many(self, queue: Queue, job_datas: Iterable[EnqueueData], pipeline: Pipeline | None = None):
+        expired_job_ids: list[str] = []
+        for start in range(0, len(job_ids), _CLEANUP_BATCH_SIZE):
+            chunk = job_ids[start : start + _CLEANUP_BATCH_SIZE]
+            with self.connection.pipeline() as pipe:
+                for job_id in chunk:
+                    pipe.exists(Job.key_for(job_id))
+                results = pipe.execute()
+            expired_job_ids.extend(
+                job_id for job_id, key_exists in zip(chunk, results) if not key_exists
+            )
+
+        if expired_job_ids:
+            # SREM in chunks as well so a single command never carries an
+            # unbounded argument list.
+            for start in range(0, len(expired_job_ids), _CLEANUP_BATCH_SIZE):
+                chunk = expired_job_ids[start : start + _CLEANUP_BATCH_SIZE]
+                with self.connection.pipeline() as pipe:
+                    pipe.srem(self.key, *chunk)
+                    pipe.execute()
+
+    def enqueue_many(
+        self,
+        queue: Queue,
+        job_datas: Iterable[EnqueueData],
+        pipeline: Pipeline | None = None,
+    ):
+        """Enqueue multiple jobs and add them to this group.
+
+        When *pipeline* is ``None`` (the default) a new pipeline is created
+        internally and executed before the method returns.  When an external
+        pipeline is supplied the caller is responsible for calling
+        ``pipeline.execute()`` — this method will **not** execute it, which
+        keeps the caller in full control of the commit boundary and prevents
+        partial commits when the group operations are part of a larger
+        transaction.
+        """
         pipe = pipeline if pipeline else self.connection.pipeline()
 
         jobs = queue.enqueue_many(job_datas, group_id=self.name, pipeline=pipe)
-
         self._add_jobs(jobs, pipeline=pipe)
 
         if pipeline is None:
@@ -65,7 +104,11 @@ class Group:
         return jobs
 
     def get_jobs(self) -> list:
-        """Retrieve list of job IDs from the group key in Redis"""
+        """Return the list of live ``Job`` objects that belong to this group.
+
+        Runs ``cleanup()`` first so that deleted / expired entries are pruned
+        before the jobs are fetched.
+        """
         self.cleanup()
         job_ids = [as_text(job) for job in self.connection.smembers(self.key)]
         return [job for job in Job.fetch_many(job_ids, self.connection) if job is not None]

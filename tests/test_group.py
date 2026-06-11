@@ -158,3 +158,117 @@ class TestGroup(RQTestCase):
         jobs[0].delete()
         assert not self.connection.exists(Group.get_key(group.name))
         assert Group.all(connection=self.connection) == []
+
+    # ------------------------------------------------------------------
+    # New tests: batch cleanup for deleted / expired jobs and pipeline
+    # commit-boundary guarantees.
+    # ------------------------------------------------------------------
+
+    def test_cleanup_removes_multiple_deleted_jobs(self):
+        """Deleting several jobs and then running cleanup() must remove all
+        of them from the group set — covers the batched-EXISTS path."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+        job_datas = [Queue.prepare_data(say_hello, job_id=f'batch_del_{i}') for i in range(5)]
+        jobs = group.enqueue_many(q, job_datas)
+        assert len(group.get_jobs()) == 5
+
+        # Delete 3 of the 5 jobs directly (this calls group.delete_job under
+        # the hood, but we also want cleanup to handle any stragglers).
+        deleted_ids = {jobs[0].id, jobs[2].id, jobs[4].id}
+        for job in [jobs[0], jobs[2], jobs[4]]:
+            # Delete from Redis *without* going through group.delete_job so
+            # that cleanup() is the mechanism that has to find them.
+            self.connection.delete(Job.key_for(job.id))
+
+        group.cleanup()
+        remaining_ids = {as_text(j) for j in self.connection.smembers(group.key)}
+        assert remaining_ids.isdisjoint(deleted_ids)
+        assert len(remaining_ids) == 2
+        q.empty()
+
+    @pytest.mark.slow
+    def test_cleanup_removes_multiple_expired_jobs(self):
+        """Jobs whose result_ttl has expired must all be pruned by a single
+        cleanup() pass — exercises the batched path with real TTL expiry."""
+        q = Queue(connection=self.connection)
+        w = SimpleWorker([q], connection=q.connection)
+        group = Group.create(connection=self.connection)
+
+        short_lived = [Queue.prepare_data(say_hello, result_ttl=1, job_id=f'expire_{i}') for i in range(3)]
+        long_lived = Queue.prepare_data(say_hello, job_id='long_lived')
+        group.enqueue_many(q, short_lived + [long_lived])
+
+        w.work(burst=True, max_jobs=3)
+        sleep(2)
+
+        group.cleanup()
+        remaining_ids = {as_text(j) for j in self.connection.smembers(group.key)}
+        assert 'long_lived' in remaining_ids
+        assert len(remaining_ids) == 1
+        q.empty()
+
+    def test_enqueue_many_external_pipeline_not_executed(self):
+        """When the caller supplies their own pipeline, Group.enqueue_many
+        must NOT call execute() on it — the caller controls the commit
+        boundary."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+
+        external_pipe = self.connection.pipeline()
+        group.enqueue_many(q, [self.job_1_data, self.job_2_data], pipeline=external_pipe)
+
+        # Nothing should have been committed yet.
+        assert not self.connection.exists(group.key)
+        group_names = {as_text(g) for g in self.connection.smembers(Group.REDIS_GROUP_KEY)}
+        assert group.name not in group_names
+
+        # Now the caller commits — everything should appear.
+        external_pipe.execute()
+        assert self.connection.exists(group.key)
+        member_ids = {as_text(j) for j in self.connection.smembers(group.key)}
+        assert member_ids == {'job1', 'job2'}
+        q.empty()
+
+    def test_enqueue_many_external_pipeline_groups_registered_atomically(self):
+        """Multiple groups added via the same external pipeline should all
+        appear (or not appear) together — no partial commits."""
+        q = Queue(connection=self.connection)
+        group_a = Group.create(name='atomic_a', connection=self.connection)
+        group_b = Group.create(name='atomic_b', connection=self.connection)
+
+        external_pipe = self.connection.pipeline()
+        group_a.enqueue_many(q, [Queue.prepare_data(say_hello, job_id='a1')], pipeline=external_pipe)
+        group_b.enqueue_many(q, [Queue.prepare_data(say_hello, job_id='b1')], pipeline=external_pipe)
+
+        # Pre-commit: neither group should be visible.
+        assert not self.connection.exists(group_a.key)
+        assert not self.connection.exists(group_b.key)
+
+        external_pipe.execute()
+
+        # Post-commit: both groups visible.
+        assert self.connection.exists(group_a.key)
+        assert self.connection.exists(group_b.key)
+        q.empty()
+
+    def test_enqueue_many_batch_with_dependencies(self):
+        """Batch-enqueueing jobs with depends_on must add all jobs (both
+        queued and deferred) to the group and set group_id on each."""
+        q = Queue(connection=self.connection)
+        parent = q.enqueue(say_hello, job_id='parent')
+        child_data = Queue.prepare_data(say_hello, depends_on=parent, job_id='child')
+        independent_data = Queue.prepare_data(say_hello, job_id='independent')
+
+        group = Group.create(connection=self.connection)
+        jobs = group.enqueue_many(q, [independent_data, child_data])
+
+        job_ids = [j.id for j in jobs]
+        assert 'independent' in job_ids
+        assert 'child' in job_ids
+        assert all(j.group_id == group.name for j in jobs)
+
+        member_ids = {as_text(j) for j in self.connection.smembers(group.key)}
+        assert 'independent' in member_ids
+        assert 'child' in member_ids
+        q.empty()
