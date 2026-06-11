@@ -158,3 +158,49 @@ class TestGroup(RQTestCase):
         jobs[0].delete()
         assert not self.connection.exists(Group.get_key(group.name))
         assert Group.all(connection=self.connection) == []
+
+    def test_get_jobs_filters_deleted_jobs(self):
+        """get_jobs() filters out already-deleted jobs and prunes their IDs from the SET."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+        jobs = group.enqueue_many(q, [self.job_1_data, self.job_2_data])
+        # Delete the job key directly to simulate expiry/external deletion
+        self.connection.delete(Job.key_for(jobs[0].id))
+        remaining = group.get_jobs()
+        assert len(remaining) == 1
+        assert remaining[0].id == jobs[1].id
+        # The deleted job ID should be cleaned from the group's Redis SET
+        group_member_ids = {as_text(m) for m in self.connection.smembers(group.key)}
+        assert jobs[0].id not in group_member_ids
+
+    def test_cleanup_removes_expired_job_ids(self):
+        """cleanup() removes job IDs whose Redis keys no longer exist."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+        jobs = group.enqueue_many(q, [self.job_1_data, self.job_2_data])
+        # Simulate job expiry by deleting the job key directly
+        self.connection.delete(Job.key_for(jobs[0].id))
+        group.cleanup()
+        group_member_ids = {as_text(m) for m in self.connection.smembers(group.key)}
+        assert jobs[0].id not in group_member_ids
+        assert jobs[1].id in group_member_ids
+
+    def test_enqueue_many_with_external_pipeline(self):
+        """enqueue_many with an external pipeline does not execute it prematurely."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+
+        pipe = self.connection.pipeline()
+        pipe.set('test_marker', 'pending')
+
+        group.enqueue_many(q, [self.job_1_data, self.job_2_data], pipeline=pipe)
+
+        # The marker should NOT exist yet — pipeline has not been executed
+        assert not self.connection.exists('test_marker')
+
+        # Now execute manually
+        pipe.execute()
+
+        # After execution, all data should be committed
+        assert self.connection.get('test_marker') == b'pending'
+        assert len(group.get_jobs()) == 2
