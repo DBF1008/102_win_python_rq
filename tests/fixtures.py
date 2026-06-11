@@ -351,3 +351,7 @@ def _send_kill_horse_command(worker_name, connection_kwargs, delay=0.25):
 
 class CustomJob(Job):
     """A custom job class just to test it"""
+
+
+class CustomQueue(Queue):
+    """A custom queue class just to test it"""

@@ -10,7 +10,7 @@ from rq.serializers import JSONSerializer
 from rq.worker import SimpleWorker
 from rq.worker_pool import WorkerPool, run_worker
 from tests import RQTestCase
-from tests.fixtures import CustomJob, _send_shutdown_command, long_running_job, say_hello
+from tests.fixtures import CustomJob, CustomQueue, _send_shutdown_command, long_running_job, say_hello
 
 
 def wait_and_send_shutdown_signal(pid, time_to_wait=0.0):
@@ -137,3 +137,73 @@ class TestWorkerPool(RQTestCase):
         pool.start(burst=True)
         # Worker should have processed the job
         self.assertEqual(job.get_status(refresh=True), JobStatus.FINISHED)
+
+    def test_get_worker_process_passes_all_custom_classes(self):
+        """get_worker_process passes worker_class, job_class, queue_class, and serializer to run_worker"""
+        pool = WorkerPool(
+            ['default'],
+            connection=self.connection,
+            worker_class=SimpleWorker,
+            job_class=CustomJob,
+            queue_class=CustomQueue,
+            serializer=JSONSerializer,
+        )
+        process = pool.get_worker_process('test-worker', burst=True)
+        kwargs = process._kwargs
+        self.assertEqual(kwargs['worker_class'], SimpleWorker)
+        self.assertEqual(kwargs['job_class'], CustomJob)
+        self.assertEqual(kwargs['queue_class'], CustomQueue)
+        self.assertEqual(kwargs['serializer'], JSONSerializer)
+
+    def test_run_worker_with_custom_classes(self):
+        """run_worker correctly uses custom queue_class, job_class, and serializer"""
+        queue = CustomQueue('foo', connection=self.connection, serializer=JSONSerializer)
+        queue.enqueue(say_hello, 'Hello')
+
+        connection_class, pool_class, pool_kwargs = parse_connection(self.connection)
+        run_worker(
+            'test-worker',
+            ['foo'],
+            connection_class,
+            pool_class,
+            pool_kwargs,
+            queue_class=CustomQueue,
+            job_class=CustomJob,
+            serializer=JSONSerializer,
+        )
+        self.assertEqual(len(queue), 0)
+
+    def test_worker_pool_burst_with_custom_classes(self):
+        """WorkerPool in burst mode propagates all custom classes to workers"""
+        queue = CustomQueue('foo', connection=self.connection, serializer=JSONSerializer)
+        job = queue.enqueue(say_hello, 'Hello')
+        pool = WorkerPool(
+            ['foo'],
+            connection=self.connection,
+            num_workers=1,
+            worker_class=SimpleWorker,
+            job_class=CustomJob,
+            queue_class=CustomQueue,
+            serializer=JSONSerializer,
+        )
+        pool.start(burst=True)
+        self.assertEqual(job.get_status(refresh=True), JobStatus.FINISHED)
+
+    def test_worker_pool_non_burst_with_custom_classes(self):
+        """WorkerPool in non-burst mode propagates all custom classes to workers"""
+        queue = CustomQueue('foo', connection=self.connection, serializer=JSONSerializer)
+        job = queue.enqueue(say_hello, 'Hello')
+        pool = WorkerPool(
+            ['foo'],
+            connection=self.connection,
+            num_workers=1,
+            worker_class=SimpleWorker,
+            job_class=CustomJob,
+            queue_class=CustomQueue,
+            serializer=JSONSerializer,
+        )
+        p = Process(target=wait_and_send_shutdown_signal, args=(os.getpid(), 1.5))
+        p.start()
+        pool.start(burst=False)
+        self.assertEqual(job.get_status(refresh=True), JobStatus.FINISHED)
+        pool.stop_workers()
