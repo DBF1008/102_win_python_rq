@@ -62,12 +62,11 @@ class EnqueueData(
             'on_failure',
             'on_stopped',
             'repeat',
+            'unique',
         ],
     )
 ):
-    """Helper type to use when calling enqueue_many
-    NOTE: Does not support `depends_on` yet.
-    """
+    """Helper type to use when calling enqueue_many"""
 
     __slots__ = ()
 
@@ -790,6 +789,7 @@ class Queue:
         on_failure: Callback | Callable | None = None,
         on_stopped: Callback | Callable | None = None,
         repeat: Repeat | None = None,
+        unique: bool = False,
     ) -> EnqueueData:
         """Need this till support dropped for python_version < 3.7, where defaults can be specified for named tuples
         And can keep this logic within EnqueueData
@@ -815,6 +815,8 @@ class Queue:
             on_stopped (Optional[Union[Callback, Callable[..., Any]]], optional): Callback for on stopped. Defaults to
                 None. Callable is deprecated.
             repeat (Optional[Repeat], optional): Repeat object. Defaults to None.
+            unique (bool, optional): If True, raises DuplicateJobError if a job with the same ID exists.
+                Defaults to False.
 
         Returns:
             EnqueueData: The EnqueueData
@@ -837,6 +839,7 @@ class Queue:
             on_failure,
             on_stopped,
             repeat,
+            unique,
         )
 
     def enqueue_many(
@@ -852,6 +855,17 @@ class Queue:
         Returns:
             List[Job]: A list of enqueued jobs
         """
+        # Materialize to list so we can iterate multiple times
+        job_datas = list(job_datas)
+
+        # Validate unique constraints upfront before any enqueue work
+        for job_data in job_datas:
+            if job_data.unique:
+                if not job_data.job_id:
+                    raise ValueError('unique=True requires an explicit job_id')
+                if job_data.depends_on:
+                    raise ValueError('unique=True is not supported with job dependencies')
+
         pipe = pipeline if pipeline is not None else self.connection.pipeline()
 
         # Add Queue key set
@@ -891,6 +905,7 @@ class Queue:
                     self.create_job(**get_job_kwargs(job_data, JobStatus.QUEUED)),
                     pipeline=pipe,
                     at_front=job_data.at_front,
+                    unique=job_data.unique,
                 )
                 for job_data in job_datas_without_dependencies
             ]
