@@ -4,7 +4,8 @@ from unittest.mock import patch
 
 from rq import Queue, Retry
 from rq.exceptions import DuplicateJobError
-from rq.job import Job, JobStatus
+from rq.job import Dependency, Job, JobStatus
+from rq.repeat import Repeat
 from rq.registry import (
     CanceledJobRegistry,
     DeferredJobRegistry,
@@ -656,6 +657,141 @@ class TestQueue(RQTestCase):
             # Only in registry after execute, since passed in pipeline
             self.assertEqual(len(q), 3)
             self.assertEqual(q.job_ids, ['fake_job_id_3', 'fake_job_id_1', 'fake_job_id_2'])
+
+    def test_enqueue_many_mixed_dependencies_met_and_unmet(self):
+        """Batch enqueue with no-dep, met-dep, and unmet-dep jobs correctly classifies statuses."""
+        q = Queue(connection=self.connection)
+
+        # Create parent jobs with different statuses
+        finished_parent = Job.create(func=say_hello, connection=self.connection)
+        finished_parent.save()
+        finished_parent.set_status(JobStatus.FINISHED)
+
+        unfinished_parent = Job.create(func=say_hello, connection=self.connection)
+        unfinished_parent.save()
+
+        # Prepare mixed batch
+        no_dep_data = Queue.prepare_data(say_hello, job_id='no_dep')
+        met_dep_data = Queue.prepare_data(say_hello, job_id='met_dep', depends_on=finished_parent)
+        unmet_dep_data = Queue.prepare_data(say_hello, job_id='unmet_dep', depends_on=unfinished_parent)
+
+        jobs = q.enqueue_many([no_dep_data, met_dep_data, unmet_dep_data])
+
+        self.assertEqual(len(jobs), 3)
+        # Return order: no-dep, then unmet, then met
+        self.assertEqual(jobs[0].id, 'no_dep')
+        self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)
+        self.assertEqual(jobs[1].id, 'unmet_dep')
+        self.assertEqual(jobs[1].get_status(), JobStatus.DEFERRED)
+        self.assertEqual(jobs[2].id, 'met_dep')
+        self.assertEqual(jobs[2].get_status(), JobStatus.QUEUED)
+
+        # Queue contains no_dep and met_dep only
+        self.assertEqual(len(q), 2)
+        self.assertIn('no_dep', q.job_ids)
+        self.assertIn('met_dep', q.job_ids)
+        self.assertNotIn('unmet_dep', q.job_ids)
+
+        # Unmet dep is in deferred registry
+        deferred_registry = DeferredJobRegistry(queue=q)
+        self.assertIn('unmet_dep', deferred_registry.get_job_ids())
+
+    def test_enqueue_many_mixed_dependencies_with_external_pipeline(self):
+        """External pipeline: met-dep enqueue is buffered until caller executes."""
+        q = Queue(connection=self.connection)
+
+        finished_parent = Job.create(func=say_hello, connection=self.connection)
+        finished_parent.save()
+        finished_parent.set_status(JobStatus.FINISHED)
+
+        unfinished_parent = Job.create(func=say_hello, connection=self.connection)
+        unfinished_parent.save()
+
+        with self.connection.pipeline() as pipe:
+            no_dep_data = Queue.prepare_data(say_hello, job_id='no_dep')
+            met_dep_data = Queue.prepare_data(say_hello, job_id='met_dep', depends_on=finished_parent)
+            unmet_dep_data = Queue.prepare_data(say_hello, job_id='unmet_dep', depends_on=unfinished_parent)
+
+            jobs = q.enqueue_many([no_dep_data, met_dep_data, unmet_dep_data], pipeline=pipe)
+
+            # Met-dep enqueue is still buffered on external pipeline
+            self.assertNotIn('met_dep', q.job_ids)
+
+            pipe.execute()
+
+            # After caller execute: met dep is now in queue
+            self.assertIn('met_dep', q.job_ids)
+            self.assertIn('no_dep', q.job_ids)
+            self.assertNotIn('unmet_dep', q.job_ids)
+
+        self.assertEqual(len(q), 2)
+        deferred_registry = DeferredJobRegistry(queue=q)
+        self.assertIn('unmet_dep', deferred_registry.get_job_ids())
+
+    def test_enqueue_many_dependencies_at_front_and_repeat(self):
+        """at_front and repeat work correctly on dependent jobs with met dependencies."""
+        q = Queue(connection=self.connection)
+
+        # Pre-populate queue so at_front ordering is visible
+        q.enqueue(say_hello, job_id='existing')
+
+        finished_parent = Job.create(func=say_hello, connection=self.connection)
+        finished_parent.save()
+        finished_parent.set_status(JobStatus.FINISHED)
+
+        dep_front_data = Queue.prepare_data(
+            say_hello,
+            job_id='dep_front',
+            depends_on=Dependency(jobs=[finished_parent], enqueue_at_front=True),
+            repeat=Repeat(times=3, interval=10),
+        )
+        no_dep_back_data = Queue.prepare_data(say_hello, job_id='no_dep_back', at_front=False)
+
+        jobs = q.enqueue_many([dep_front_data, no_dep_back_data])
+
+        # dep_front should be at front (enqueue_at_front via Dependency)
+        job_ids = q.job_ids
+        self.assertEqual(job_ids[0], 'dep_front')
+        self.assertIn('no_dep_back', job_ids)
+        self.assertIn('existing', job_ids)
+
+        # Repeat metadata is preserved on dependent job
+        dep_job = Job.fetch('dep_front', connection=self.connection)
+        self.assertEqual(dep_job.repeats_left, 3)
+        self.assertEqual(dep_job.repeat_intervals, [10])
+
+    def test_enqueue_many_allow_failure_dependency(self):
+        """Dependent with allow_failure=True is QUEUED even when parent is FAILED."""
+        q = Queue(connection=self.connection)
+
+        failed_parent = Job.create(func=say_hello, connection=self.connection)
+        failed_parent.save()
+        failed_parent.set_status(JobStatus.FAILED)
+
+        allow_data = Queue.prepare_data(
+            say_hello,
+            job_id='allow_fail',
+            depends_on=Dependency(jobs=[failed_parent], allow_failure=True),
+        )
+        deny_data = Queue.prepare_data(
+            say_hello,
+            job_id='deny_fail',
+            depends_on=failed_parent,
+        )
+
+        jobs = q.enqueue_many([allow_data, deny_data])
+
+        # Return order: [deny_fail (unmet)] + [allow_fail (met)]
+        self.assertEqual(jobs[0].id, 'deny_fail')
+        self.assertEqual(jobs[0].get_status(), JobStatus.DEFERRED)
+        self.assertEqual(jobs[1].id, 'allow_fail')
+        self.assertEqual(jobs[1].get_status(), JobStatus.QUEUED)
+
+        self.assertEqual(len(q), 1)
+        self.assertIn('allow_fail', q.job_ids)
+
+        deferred_registry = DeferredJobRegistry(queue=q)
+        self.assertIn('deny_fail', deferred_registry.get_job_ids())
 
     def test_enqueue_different_queues_with_passed_pipeline(self):
         """Jobs should be enqueued into different queues in a provided pipeline"""

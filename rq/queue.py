@@ -883,8 +883,11 @@ class Queue:
                 'repeat': job_data.repeat,
             }
 
-        # Enqueue jobs without dependencies
+        # Partition into independent and dependent jobs
         job_datas_without_dependencies = [job_data for job_data in job_datas if not job_data.depends_on]
+        job_datas_with_dependencies = [job_data for job_data in job_datas if job_data.depends_on]
+
+        # Buffer enqueue commands for independent jobs
         if job_datas_without_dependencies:
             jobs_without_dependencies = [
                 self._enqueue_job(
@@ -894,24 +897,22 @@ class Queue:
                 )
                 for job_data in job_datas_without_dependencies
             ]
-            if pipeline is None:
-                pipe.execute()
 
-        job_datas_with_dependencies = [job_data for job_data in job_datas if job_data.depends_on]
         if job_datas_with_dependencies:
-            # Save all jobs with dependencies as deferred
+            # Buffer save commands for dependent jobs as deferred
             jobs_with_dependencies = [
                 self.create_job(**get_job_kwargs(job_data, JobStatus.DEFERRED))
                 for job_data in job_datas_with_dependencies
             ]
             for job in jobs_with_dependencies:
                 job.save(pipeline=pipe)
-            if pipeline is None:
-                pipe.execute()
 
-            # Enqueue the jobs whose dependencies have been met
+            # Flush: queue registration + independent enqueue + dependent save (merged)
+            pipe.execute()
+
+            # Check and enqueue met dependencies using batched internal pipelines
             jobs_with_met_dependencies, jobs_with_unmet_dependencies = Dependency.get_jobs_with_met_dependencies(
-                jobs_with_dependencies, pipeline=pipe
+                jobs_with_dependencies, connection=self.connection
             )
             jobs_with_met_dependencies = [
                 self._enqueue_job(job, pipeline=pipe, at_front=job.enqueue_at_front)
@@ -919,6 +920,8 @@ class Queue:
             ]
             if pipeline is None:
                 pipe.execute()
+        elif pipeline is None:
+            pipe.execute()
 
         return jobs_without_dependencies + jobs_with_unmet_dependencies + jobs_with_met_dependencies
 
