@@ -1745,10 +1745,12 @@ class Job:
         pipeline: Pipeline | None = None,
         exclude_job_id: str | None = None,
         refresh_job_status: bool = True,
+        watch: bool = True,
     ) -> bool:
         """Returns a boolean indicating if all of this job's dependencies are `FINISHED`
 
-        If a pipeline is passed, all dependencies are WATCHed.
+        If a pipeline is passed and ``watch`` is True, all dependencies are WATCHed
+        for optimistic locking.
 
         `parent_job` allows us to directly pass parent_job for the status check.
         This is useful when enqueueing the dependents of a _successful_ job -- that status of
@@ -1760,13 +1762,14 @@ class Job:
             pipeline (Optional[Pipeline], optional): The Redis' pipeline. Defaults to None.
             exclude_job_id (Optional[str], optional): Whether to exclude the job id. Defaults to None.
             refresh_job_status (bool): whether to refresh job status when checking for dependencies. Defaults to True.
+            watch (bool): whether to WATCH dependency keys for optimistic locking when a pipeline is provided. Defaults to True.
 
         Returns:
             are_met (bool): Whether the dependencies were met.
         """
         connection = pipeline if pipeline is not None else self.connection
 
-        if pipeline is not None:
+        if pipeline is not None and watch:
             connection.watch(*[self.key_for(dependency_id) for dependency_id in self._dependency_ids])
 
         dependencies_ids = {_id.decode() for _id in connection.smembers(self.dependencies_key)}

@@ -883,7 +883,8 @@ class Queue:
                 'repeat': job_data.repeat,
             }
 
-        # Enqueue jobs without dependencies
+        # Phase 1: Queue no-dependency jobs AND save dependency jobs in a
+        # single pipeline round-trip (internal pipeline only).
         job_datas_without_dependencies = [job_data for job_data in job_datas if not job_data.depends_on]
         if job_datas_without_dependencies:
             jobs_without_dependencies = [
@@ -894,24 +895,27 @@ class Queue:
                 )
                 for job_data in job_datas_without_dependencies
             ]
-            if pipeline is None:
-                pipe.execute()
 
         job_datas_with_dependencies = [job_data for job_data in job_datas if job_data.depends_on]
         if job_datas_with_dependencies:
-            # Save all jobs with dependencies as deferred
             jobs_with_dependencies = [
                 self.create_job(**get_job_kwargs(job_data, JobStatus.DEFERRED))
                 for job_data in job_datas_with_dependencies
             ]
             for job in jobs_with_dependencies:
                 job.save(pipeline=pipe)
-            if pipeline is None:
-                pipe.execute()
 
-            # Enqueue the jobs whose dependencies have been met
+        # Single execute for Phase 1 + Phase 2 (or defer to caller).
+        if (job_datas_without_dependencies or job_datas_with_dependencies) and pipeline is None:
+            pipe.execute()
+
+        if job_datas_with_dependencies:
+            # Phase 3: batch-check dependencies and enqueue met jobs.
             jobs_with_met_dependencies, jobs_with_unmet_dependencies = Dependency.get_jobs_with_met_dependencies(
-                jobs_with_dependencies, pipeline=pipe
+                jobs_with_dependencies,
+                pipeline=pipe,
+                is_external_pipeline=(pipeline is not None),
+                connection=self.connection,
             )
             jobs_with_met_dependencies = [
                 self._enqueue_job(job, pipeline=pipe, at_front=job.enqueue_at_front)

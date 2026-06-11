@@ -3,6 +3,8 @@ from multiprocessing import Process
 from rq import Queue, SimpleWorker, Worker
 from rq.connections import get_connection_kwargs
 from rq.job import Dependency, Job, JobStatus
+from rq.registry import DeferredJobRegistry
+from rq.repeat import Repeat
 from rq.utils import current_timestamp
 from tests import RQTestCase
 from tests.fixtures import check_dependencies_are_met, div_by_zero, kill_horse, long_running_job, say_hello
@@ -307,3 +309,240 @@ class TestDependencies(RQTestCase):
         # Verify enqueue_dependents does not enqueue the dependent
         q.enqueue_dependents(parent_job)
         self.assertEqual(dependent_job.get_status(), JobStatus.DEFERRED)
+
+    # ── Batch enqueue_many enhancement tests ─────────────────────────────
+
+    def test_enqueue_many_deps_satisfied_internal_pipeline(self):
+        """enqueue_many: when parent is already FINISHED, dep jobs are
+        immediately enqueued via the internal (auto-created) pipeline."""
+        q = Queue(connection=self.connection)
+        parent = q.enqueue(say_hello)
+        parent.set_status(JobStatus.FINISHED)
+
+        dep_data = Queue.prepare_data(say_hello, depends_on=parent, job_id='dep_met')
+        jobs = q.enqueue_many([dep_data])
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)
+        self.assertIn('dep_met', q.job_ids)
+
+    def test_enqueue_many_deps_unsatisfied_internal_pipeline(self):
+        """enqueue_many: when parent is still running, dep jobs remain
+        DEFERRED and are registered in DeferredJobRegistry."""
+        q = Queue(connection=self.connection)
+        parent = q.enqueue(say_hello)  # status = QUEUED
+
+        dep_data = Queue.prepare_data(say_hello, depends_on=parent, job_id='dep_unmet')
+        jobs = q.enqueue_many([dep_data])
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].get_status(), JobStatus.DEFERRED)
+        self.assertNotIn('dep_unmet', q.job_ids)
+        self.assertIn('dep_unmet', q.deferred_job_registry.get_job_ids())
+
+    def test_enqueue_many_mixed_internal_pipeline(self):
+        """enqueue_many: mixed batch of no-dep, deps-met, deps-unmet,
+        at_front, and repeat jobs via the internal pipeline.
+
+        Validates queue ordering: at_front jobs come first, then FIFO.
+        """
+        q = Queue(connection=self.connection)
+
+        parent_finished = q.enqueue(say_hello, job_id='parent_done')
+        parent_finished.set_status(JobStatus.FINISHED)
+
+        parent_pending = q.enqueue(say_hello, job_id='parent_todo')  # QUEUED
+
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='no_dep_1'),
+            Queue.prepare_data(say_hello, job_id='no_dep_front', at_front=True),
+            Queue.prepare_data(say_hello, job_id='dep_met_1', depends_on=parent_finished),
+            Queue.prepare_data(say_hello, job_id='dep_unmet_1', depends_on=parent_pending),
+            Queue.prepare_data(say_hello, job_id='repeat_job', repeat=Repeat(times=2, interval=10)),
+        ]
+
+        jobs = q.enqueue_many(job_datas)
+        self.assertEqual(len(jobs), 5)
+
+        # no-dep and deps-met → QUEUED; deps-unmet → DEFERRED
+        self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)   # no_dep_1
+        self.assertEqual(jobs[1].get_status(), JobStatus.QUEUED)   # no_dep_front
+        self.assertEqual(jobs[2].get_status(), JobStatus.QUEUED)   # dep_met_1
+        self.assertEqual(jobs[3].get_status(), JobStatus.DEFERRED) # dep_unmet_1
+        self.assertEqual(jobs[4].get_status(), JobStatus.QUEUED)   # repeat_job
+
+        # Queue order: at_front first, then FIFO insertion order
+        self.assertEqual(
+            q.job_ids,
+            ['no_dep_front', 'no_dep_1', 'dep_met_1', 'repeat_job'],
+        )
+
+        # Deferred registry contains only the unmet job
+        self.assertIn('dep_unmet_1', q.deferred_job_registry.get_job_ids())
+
+        # Repeat metadata persisted
+        jobs[4].refresh()
+        self.assertEqual(jobs[4].repeats_left, 2)
+        self.assertEqual(jobs[4].repeat_intervals, [10])
+
+    def test_enqueue_many_mixed_external_pipeline(self):
+        """enqueue_many: same mixed batch but with an external pipeline.
+
+        Nothing should be visible in Redis until the caller calls execute().
+        """
+        q = Queue(connection=self.connection)
+
+        parent_finished = q.enqueue(say_hello, job_id='parent_done')
+        parent_finished.set_status(JobStatus.FINISHED)
+
+        parent_pending = q.enqueue(say_hello, job_id='parent_todo')
+
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='no_dep_1'),
+            Queue.prepare_data(say_hello, job_id='no_dep_front', at_front=True),
+            Queue.prepare_data(say_hello, job_id='dep_met_1', depends_on=parent_finished),
+            Queue.prepare_data(say_hello, job_id='dep_unmet_1', depends_on=parent_pending),
+            Queue.prepare_data(say_hello, job_id='repeat_job', repeat=Repeat(times=3, interval=5)),
+        ]
+
+        with self.connection.pipeline() as pipe:
+            jobs = q.enqueue_many(job_datas, pipeline=pipe)
+
+            # Before execute: nothing pushed to the queue yet
+            self.assertEqual(q.job_ids, [])
+
+            pipe.execute()
+
+        # After execute: correct statuses
+        self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)
+        self.assertEqual(jobs[1].get_status(), JobStatus.QUEUED)
+        self.assertEqual(jobs[2].get_status(), JobStatus.QUEUED)
+        self.assertEqual(jobs[3].get_status(), JobStatus.DEFERRED)
+        self.assertEqual(jobs[4].get_status(), JobStatus.QUEUED)
+
+        self.assertEqual(
+            q.job_ids,
+            ['no_dep_front', 'no_dep_1', 'dep_met_1', 'repeat_job'],
+        )
+        self.assertIn('dep_unmet_1', q.deferred_job_registry.get_job_ids())
+
+        jobs[4].refresh()
+        self.assertEqual(jobs[4].repeats_left, 3)
+
+    def test_enqueue_many_external_pipeline_deps_unsatisfied(self):
+        """enqueue_many with external pipeline: deps-unmet stays DEFERRED
+        and transitions to QUEUED once the parent finishes."""
+        q = Queue(connection=self.connection)
+        w = SimpleWorker([q], connection=q.connection)
+
+        parent = q.enqueue(say_hello, job_id='parent_todo')
+
+        with self.connection.pipeline() as pipe:
+            dep_data = Queue.prepare_data(say_hello, job_id='child_1', depends_on=parent)
+            jobs = q.enqueue_many([dep_data], pipeline=pipe)
+            pipe.execute()
+
+        self.assertEqual(jobs[0].get_status(), JobStatus.DEFERRED)
+
+        # Process parent → child should transition to QUEUED
+        w.work(burst=True, max_jobs=1)
+        self.assertEqual(parent.get_status(), JobStatus.FINISHED)
+        self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)
+
+    def test_enqueue_many_external_pipeline_cross_queue(self):
+        """enqueue_many across multiple queues within a single external
+        pipeline should be atomic — nothing visible until execute()."""
+        q1 = Queue(name='q1', connection=self.connection)
+        q2 = Queue(name='q2', connection=self.connection)
+
+        with self.connection.pipeline() as pipe:
+            jobs1 = q1.enqueue_many(
+                [Queue.prepare_data(say_hello, job_id='q1_j1')],
+                pipeline=pipe,
+            )
+            jobs2 = q2.enqueue_many(
+                [Queue.prepare_data(say_hello, job_id='q2_j1')],
+                pipeline=pipe,
+            )
+            # Before execute: neither queue has jobs
+            self.assertEqual(q1.job_ids, [])
+            self.assertEqual(q2.job_ids, [])
+            pipe.execute()
+
+        self.assertIn('q1_j1', q1.job_ids)
+        self.assertIn('q2_j1', q2.job_ids)
+
+    def test_enqueue_many_allow_failure_in_batch(self):
+        """enqueue_many respects allow_failure in a mixed batch:
+        dep job with allow_failure=True is enqueued even if parent FAILED."""
+        q = Queue(connection=self.connection)
+
+        parent_failed = q.enqueue(div_by_zero, job_id='parent_fail')
+        parent_failed.set_status(JobStatus.FAILED)
+
+        dep_allow = Queue.prepare_data(
+            say_hello,
+            job_id='dep_allow',
+            depends_on=Dependency(jobs=parent_failed, allow_failure=True),
+        )
+        dep_deny = Queue.prepare_data(
+            say_hello,
+            job_id='dep_deny',
+            depends_on=Dependency(jobs=parent_failed, allow_failure=False),
+        )
+
+        jobs = q.enqueue_many([dep_allow, dep_deny])
+
+        self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)   # allow_failure
+        self.assertEqual(jobs[1].get_status(), JobStatus.DEFERRED) # deny_failure
+
+    def test_enqueue_many_multiple_deps_batch(self):
+        """enqueue_many with several dep jobs sharing the same parent:
+        batch WATCH should correctly classify all of them."""
+        q = Queue(connection=self.connection)
+        w = SimpleWorker([q], connection=q.connection)
+
+        parent_a = q.enqueue(say_hello, job_id='pa')
+        parent_b = q.enqueue(say_hello, job_id='pb')
+        parent_a.set_status(JobStatus.FINISHED)
+        # parent_b stays QUEUED
+
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='c1', depends_on=parent_a),
+            Queue.prepare_data(say_hello, job_id='c2', depends_on=parent_a),
+            Queue.prepare_data(say_hello, job_id='c3', depends_on=parent_b),
+            Queue.prepare_data(say_hello, job_id='c4', depends_on=[parent_a, parent_b]),
+        ]
+
+        jobs = q.enqueue_many(job_datas)
+
+        # c1, c2 met (parent_a finished); c3, c4 unmet (parent_b still queued)
+        self.assertEqual(jobs[0].get_status(), JobStatus.QUEUED)   # c1
+        self.assertEqual(jobs[1].get_status(), JobStatus.QUEUED)   # c2
+        self.assertEqual(jobs[2].get_status(), JobStatus.DEFERRED) # c3
+        self.assertEqual(jobs[3].get_status(), JobStatus.DEFERRED) # c4
+
+        # Process parent_b → c3 and c4 should become QUEUED
+        w.work(burst=True, max_jobs=1)
+        self.assertEqual(parent_b.get_status(), JobStatus.FINISHED)
+        self.assertEqual(jobs[2].get_status(), JobStatus.QUEUED)
+        self.assertEqual(jobs[3].get_status(), JobStatus.QUEUED)
+
+    def test_enqueue_many_empty_batch(self):
+        """enqueue_many with an empty list should be a no-op."""
+        q = Queue(connection=self.connection)
+        jobs = q.enqueue_many([])
+        self.assertEqual(jobs, [])
+        self.assertEqual(len(q), 0)
+
+    def test_enqueue_many_only_no_dep_jobs(self):
+        """enqueue_many with only no-dep jobs uses a single pipeline round-trip."""
+        q = Queue(connection=self.connection)
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id=f'j{i}') for i in range(5)
+        ]
+        jobs = q.enqueue_many(job_datas)
+        self.assertEqual(len(jobs), 5)
+        self.assertEqual(len(q), 5)
+        for job in jobs:
+            self.assertEqual(job.get_status(), JobStatus.QUEUED)
