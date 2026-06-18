@@ -18,7 +18,7 @@ jobs:
     name: Run SSL tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build the Docker test image for tox
         uses: docker/build-push-action@v6
         with:
@@ -47,7 +47,7 @@ jobs:
             redis-py-version: 8
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6.2.0
@@ -80,7 +80,7 @@ jobs:
     name: Type check
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v6.2.0
